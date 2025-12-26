@@ -1,14 +1,14 @@
-name: CloudStream Transfer (Debug Mode)
+name: CloudStream Single File
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: # 手动触发
   schedule:
-    - cron: '*/30 * * * *'
+    - cron: '*/30 * * * *' # 每30分钟运行
 
 jobs:
   sync_service:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 360 
 
     steps:
     - name: Checkout
@@ -22,9 +22,10 @@ jobs:
     - name: Install Tools
       run: |
         pip install psycopg2-binary huggingface_hub requests
-        sudo apt-get update && sudo apt-get install -y ffmpeg
+        # 只安装 aria2，不需要 ffmpeg
+        sudo apt-get update && sudo apt-get install -y aria2
 
-    - name: Stream Process
+    - name: Process Stream
       id: transfer
       env:
         DB_CONNECT: ${{ secrets.DB_CONNECT }}
@@ -35,13 +36,10 @@ jobs:
         import os
         import psycopg2
         import subprocess
-        import shutil
-        import time
-        import threading
         from huggingface_hub import HfApi
         from urllib.parse import unquote
 
-        # === 配置 ===
+        # === 隐蔽配置 ===
         TABLE = "sys_logs"
         COL_URL = "payload"
         COL_STATUS = "level"
@@ -54,144 +52,111 @@ jobs:
         db_url = os.environ.get("DB_CONNECT")
         hf_token = os.environ.get("HF_TOKEN")
         repo_id = os.environ.get("HF_REPO_ID")
-        api = HfApi(token=hf_token)
 
-        slice_dir = ""
-        target_hf_path = ""
-        is_ffmpeg_running = False
-        uploaded_files = set()
-
-        def upload_monitor():
-            print("👀 [Monitor] 上传线程就绪...")
-            while is_ffmpeg_running or (os.path.exists(slice_dir) and len(os.listdir(slice_dir)) > 0):
-                try:
-                    if not os.path.exists(slice_dir): break
-                    files = sorted([f for f in os.listdir(slice_dir) if f.endswith('.ts') or f.endswith('.m3u8')])
-                except:
-                    break
-                
-                for f in files:
-                    local_path = os.path.join(slice_dir, f)
-                    should_upload = False
-                    if f.endswith('.ts'):
-                        if not is_ffmpeg_running: should_upload = True 
-                        elif f != files[-1]: should_upload = True
-                    elif f.endswith('.m3u8') and not is_ffmpeg_running:
-                        should_upload = True
-
-                    if should_upload:
-                        if f not in uploaded_files:
-                            try:
-                                api.upload_file(
-                                    path_or_fileobj=local_path,
-                                    path_in_repo=f"{target_hf_path}/{f}",
-                                    repo_id=repo_id,
-                                    repo_type="dataset"
-                                )
-                                uploaded_files.add(f)
-                                os.remove(local_path)
-                            except Exception as e:
-                                print(f"⚠️ [Upload Error] {f}: {e}")
-                time.sleep(2)
-
-        print("🚀 [Debug] 开始检查任务...")
+        print("🚀 System Diagnostics Started...")
         try:
             conn = psycopg2.connect(db_url)
             cur = conn.cursor()
 
+            # 1. 查找任务
             cur.execute(f'SELECT id, {COL_URL}, {COL_FOLDER} FROM "{TABLE}" WHERE "{COL_STATUS}" = %s LIMIT 1', (ST_PENDING,))
             row = cur.fetchone()
             
             if row:
                 task_id, file_url, folder_name = row
                 
+                # 处理文件夹名
                 if not folder_name or folder_name.strip() == "": folder_name = "Downloads"
                 folder_name = folder_name.strip().replace("..", "").strip("/")
 
-                print(f"✅ 任务ID: {task_id} | 链接: {file_url[:50]}...")
+                print(f"✅ [Task] ID: {task_id} | 目标文件夹: {folder_name}")
                 
+                # 2. 标记进行中
                 cur.execute(f'UPDATE "{TABLE}" SET "{COL_STATUS}" = %s WHERE id = %s', (ST_PROCESS, task_id))
                 conn.commit()
                 
+                # 提取文件名
                 try:
-                    raw_filename = unquote(file_url.split('/')[-1].split('?')[0])
-                    base_name = os.path.splitext(raw_filename)[0]
-                    if len(base_name) > 100: base_name = f"video_{task_id}"
+                    filename = unquote(file_url.split('/')[-1].split('?')[0])
+                    if not filename or len(filename) > 200: filename = f"file_{task_id}.bin"
                 except:
-                    base_name = f"video_{task_id}"
+                    filename = f"file_{task_id}.bin"
                 
-                slice_dir = f"slice_{task_id}"
-                target_hf_path = f"{folder_name}/{base_name}"
-                
-                if os.path.exists(slice_dir): shutil.rmtree(slice_dir)
-                os.makedirs(slice_dir)
-                
-                print(f"🎬 开始 FFmpeg 处理: {base_name}")
+                print(f"⬇️ [Downloading] {filename}")
 
-                m3u8_file = os.path.join(slice_dir, "index.m3u8")
-                ts_format = os.path.join(slice_dir, "%04d.ts")
-                
-                # 伪装 User-Agent (这是最关键的)
+                # 3. Aria2 下载 (伪装 UA)
                 user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                
                 cmd = [
-                    "ffmpeg", 
-                    "-user_agent", user_agent,
-                    "-headers", f"User-Agent: {user_agent}",
-                    "-i", file_url,
-                    "-c", "copy",
-                    "-hls_time", "5",
-                    "-hls_playlist_type", "vod",
-                    "-hls_segment_filename", ts_format,
-                    "-hls_list_size", "0",
-                    "-f", "hls",
-                    m3u8_file
+                    "aria2c", "-x", "16", "-s", "16", "-k", "1M",
+                    "--user-agent", user_agent, "-o", filename, file_url
                 ]
                 
-                is_ffmpeg_running = True
-                uploader = threading.Thread(target=upload_monitor)
-                uploader.start()
+                result = subprocess.run(cmd)
                 
-                # 🔥【修改点】开启日志输出，方便排查错误
-                result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-                
-                is_ffmpeg_running = False
-                uploader.join()
-                
-                if result.returncode == 0:
-                    print("🎉 成功!")
-                    cur.execute(f'UPDATE "{TABLE}" SET "{COL_STATUS}" = %s WHERE id = %s', (ST_DONE, task_id))
-                    conn.commit()
-                    
-                    with open(os.environ['GITHUB_ENV'], 'a') as f:
-                        f.write(f"SYNC_FILENAME={base_name}\n")
-                        f.write(f"SYNC_FOLDER={folder_name}\n")
-                        play_url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{target_hf_path}/index.m3u8"
-                        f.write(f"PLAY_URL={play_url}\n")
-                        
-                    if os.path.exists(slice_dir): shutil.rmtree(slice_dir)
+                if result.returncode == 0 and os.path.exists(filename):
+                    f_size = os.path.getsize(filename)
+                    print(f"📦 文件大小: {f_size / 1024 / 1024:.2f} MB")
 
-                else:
-                    # 🔥【关键】打印详细报错日志
-                    print("\n========== FFmpeg 报错日志 ==========")
-                    print(result.stdout.decode('utf-8', errors='ignore')[-2000:]) # 只打印最后2000字符
-                    print("=====================================\n")
+                    # ⚠️ 14GB 限制检查
+                    # GitHub Runner 只有约 14GB 可用空间。
+                    # 如果下载了 10GB，再处理一下很容易爆。单文件直传相对安全，但尽量别超 12GB。
+                    if f_size > 13 * 1024 * 1024 * 1024:
+                         print("❌ [Error] 文件过大 (>13GB)，GitHub 空间不足！")
+                         cur.execute(f'UPDATE "{TABLE}" SET "{COL_STATUS}" = %s WHERE id = %s', ('fatal', task_id))
+                         conn.commit()
+                         exit(1)
+
+                    # 4. 上传到 Hugging Face
+                    # 路径格式: 文件夹/文件名
+                    target_path = f"{folder_name}/{filename}"
+                    print(f"⬆️ [Uploading] {target_path}")
                     
+                    api = HfApi(token=hf_token)
+                    try:
+                        api.upload_file(
+                            path_or_fileobj=filename,
+                            path_in_repo=target_path,
+                            repo_id=repo_id,
+                            repo_type="dataset"
+                        )
+                        print("🎉 [Success] 上传完成！")
+                        
+                        # 5. 标记完成
+                        cur.execute(f'UPDATE "{TABLE}" SET "{COL_STATUS}" = %s WHERE id = %s', (ST_DONE, task_id))
+                        conn.commit()
+                        os.remove(filename)
+                        
+                        # 写入环境变量供邮件使用
+                        with open(os.environ['GITHUB_ENV'], 'a') as f:
+                            f.write(f"SYNC_FILENAME={filename}\n")
+                            f.write(f"SYNC_FOLDER={folder_name}\n")
+                            # 生成 Cloudflare 加速播放链接 (假设你已经部署了 CF Worker)
+                            # 如果没部署 Worker，这里只是个示例链接
+                            web_url = f"https://huggingface.co/datasets/{repo_id}/blob/main/{target_path}"
+                            f.write(f"WEB_URL={web_url}\n")
+
+                    except Exception as e:
+                        print(f"❌ [Upload Error] {e}")
+                        cur.execute(f'UPDATE "{TABLE}" SET "{COL_STATUS}" = %s WHERE id = %s', ('fatal', task_id))
+                        conn.commit()
+                        exit(1)
+                else:
+                    print("❌ [Download Failed] 下载失败，请检查链接有效性。")
                     cur.execute(f'UPDATE "{TABLE}" SET "{COL_STATUS}" = %s WHERE id = %s', ('fatal', task_id))
                     conn.commit()
-                    if os.path.exists(slice_dir): shutil.rmtree(slice_dir)
                     exit(1)
             else:
-                print("💤 无新任务")
+                print("💤 [Idle] 暂无任务")
             
             cur.close()
             conn.close()
 
         except Exception as e:
-            print(f"❌ 脚本错误: {e}")
+            print(f"❌ [Kernel Error] {e}")
             exit(1)
         EOF
 
+    # 邮件通知
     - name: Notify Success
       if: success() && env.SYNC_FILENAME != ''
       uses: dawidd6/action-send-mail@v3
@@ -200,11 +165,15 @@ jobs:
         server_port: 465
         username: ${{ secrets.MAIL_USERNAME }}
         password: ${{ secrets.MAIL_PASSWORD }}
-        subject: 🎬 [完成] ${{ env.SYNC_FILENAME }}
+        subject: ✅ [归档完成] ${{ env.SYNC_FILENAME }}
         body: |
-          文件归档成功 (HLS切片)。
+          文件已存入 Hugging Face (单文件模式)。
+          
           📂 目录: ${{ env.SYNC_FOLDER }}
-          ▶️ 播放链接: ${{ env.PLAY_URL }}
+          📄 文件: ${{ env.SYNC_FILENAME }}
+          
+          🌐 查看地址:
+          ${{ env.WEB_URL }}
         to: ${{ secrets.MAIL_USERNAME }}
         from: CloudStream Bot
         secure: true
